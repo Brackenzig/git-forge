@@ -11,7 +11,7 @@
 // (issue read/write, push, shallow clone) are single Map lookups plus one
 // JSON.stringify / one deflate, which is what makes the timed workloads fast.
 
-import http from 'node:http';
+import net from 'node:net';
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 
@@ -1120,7 +1120,7 @@ function paginate<T>(items: T[], query: URLSearchParams): { items: T[]; next: nu
 // ---------------------------------------------------------------------------
 // HTTP plumbing for JSON surfaces
 
-function sendJson(res: http.ServerResponse, status: number, obj: unknown, extra?: Record<string, string>): void {
+function sendJson(res: Res, status: number, obj: unknown, extra?: Record<string, string>): void {
   const body = JSON.stringify(obj);
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
@@ -1129,7 +1129,7 @@ function sendJson(res: http.ServerResponse, status: number, obj: unknown, extra?
   });
   res.end(body);
 }
-function sendErr(res: http.ServerResponse, status: number, message: string): void {
+function sendErr(res: Res, status: number, message: string): void {
   sendJson(res, status, { message, documentation_url: 'https://docs.github.com/rest' });
 }
 function linkHeader(base: string, path: string, query: URLSearchParams, next: number | null): Record<string, string> {
@@ -1143,8 +1143,8 @@ function linkHeader(base: string, path: string, query: URLSearchParams, next: nu
 // REST v3 router
 
 function handleRest(
-  req: http.IncomingMessage,
-  res: http.ServerResponse,
+  req: Req,
+  res: Res,
   method: string,
   segs: string[],
   query: URLSearchParams,
@@ -1327,8 +1327,8 @@ function handleRest(
 }
 
 function handleContents(
-  req: http.IncomingMessage,
-  res: http.ServerResponse,
+  req: Req,
+  res: Res,
   method: string,
   repo: Repo,
   path: string,
@@ -1441,8 +1441,8 @@ function handleContents(
 }
 
 function handleIssues(
-  req: http.IncomingMessage,
-  res: http.ServerResponse,
+  req: Req,
+  res: Res,
   method: string,
   repo: Repo,
   rest: string[],
@@ -1530,8 +1530,8 @@ function handleIssues(
 }
 
 function handlePulls(
-  req: http.IncomingMessage,
-  res: http.ServerResponse,
+  req: Req,
+  res: Res,
   method: string,
   repo: Repo,
   rest: string[],
@@ -2564,7 +2564,7 @@ function mcpCallTool(name: string, args: Record<string, unknown>): Record<string
   return { __rpcError: { code: -32602, message: `Unknown tool: ${name}` } };
 }
 
-function handleMcp(res: http.ServerResponse, rawBody: Buffer): void {
+function handleMcp(res: Res, rawBody: Buffer): void {
   let parsed: unknown;
   try {
     parsed = JSON.parse(rawBody.toString('utf8'));
@@ -2639,171 +2639,302 @@ function handleMcp(res: http.ServerResponse, rawBody: Buffer): void {
 // ---------------------------------------------------------------------------
 // HTTP server: routing, auth, body handling
 
-function authed(req: http.IncomingMessage): boolean {
+// ---------------------------------------------------------------------------
+// Raw-socket HTTP/1.1 transport (replaces node:http).
+//
+// The suite's client speaks plain HTTP/1.1 over keep-alive connections.
+// Parsing a request and writing its response straight on the socket skips
+// the stdlib server's per-request churn (IncomingMessage / ServerResponse
+// objects, header objects, stream machinery), which dominated the timed
+// workloads' wall time. The request handler is synchronous once the body
+// is buffered, so each socket is served strictly in order.
+
+interface Req {
+  method: string;
+  url: string;
+  headers: { host?: string; authorization?: string };
+  body: Buffer;
+}
+
+const EMPTY_BUF = Buffer.alloc(0);
+const RESP_100 = Buffer.from('HTTP/1.1 100 Continue\r\n\r\n', 'latin1');
+const STATUS_TEXT: Record<number, string> = {
+  200: 'OK',
+  201: 'Created',
+  202: 'Accepted',
+  204: 'No Content',
+  400: 'Bad Request',
+  401: 'Unauthorized',
+  404: 'Not Found',
+  422: 'Unprocessable Entity',
+  500: 'Internal Server Error',
+};
+
+class Res {
+  headersSent = false;
+  private sock: net.Socket;
+  private keepAlive: boolean;
+  private status = 200;
+  private head: Record<string, string> = {};
+  constructor(sock: net.Socket, keepAlive: boolean) {
+    this.sock = sock;
+    this.keepAlive = keepAlive;
+  }
+  writeHead(status: number, headers: Record<string, string>): void {
+    this.status = status;
+    this.head = headers;
+  }
+  end(body?: Buffer | string): void {
+    if (this.headersSent) return;
+    this.headersSent = true;
+    const b = body === undefined ? EMPTY_BUF : typeof body === 'string' ? Buffer.from(body, 'utf8') : body;
+    let h = `HTTP/1.1 ${this.status} ${STATUS_TEXT[this.status] ?? ''}\r\n`;
+    for (const k of Object.keys(this.head)) h += `${k}: ${this.head[k]}\r\n`;
+    h += `content-length: ${b.length}\r\nconnection: ${this.keepAlive ? 'keep-alive' : 'close'}\r\n\r\n`;
+    const hb = Buffer.from(h, 'latin1');
+    this.sock.write(b.length === 0 ? hb : Buffer.concat([hb, b]));
+    if (!this.keepAlive) this.sock.end();
+  }
+}
+
+// Parse one complete HTTP/1.1 request from the front of buf.
+// Returns null when more bytes are needed. Supports Content-Length and
+// chunked bodies, keep-alive, and answers Expect: 100-continue at once.
+function tryParse(
+  buf: Buffer,
+  sock: net.Socket,
+): { req: Req; rest: Buffer; keepAlive: boolean } | null {
+  const headEnd = buf.indexOf('\r\n\r\n');
+  if (headEnd === -1) {
+    if (buf.length > 65536) sock.destroy();
+    return null;
+  }
+  const head = buf.subarray(0, headEnd).toString('latin1');
+  const lines = head.split('\r\n');
+  const rl = lines[0]!.split(' ');
+  const method = rl[0] ?? 'GET';
+  const target = rl[1] ?? '/';
+  const version = rl[2] ?? 'HTTP/1.1';
+  let host: string | undefined;
+  let authorization: string | undefined;
+  let contentLength = 0;
+  let chunked = false;
+  let connection = '';
+  let expectContinue = false;
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i]!;
+    const c = line.indexOf(':');
+    if (c === -1) continue;
+    const name = line.slice(0, c).trim().toLowerCase();
+    const value = line.slice(c + 1).trim();
+    if (name === 'host') host = value;
+    else if (name === 'authorization') authorization = value;
+    else if (name === 'content-length') contentLength = parseInt(value, 10) || 0;
+    else if (name === 'transfer-encoding') chunked = value.toLowerCase().includes('chunked');
+    else if (name === 'connection') connection = value.toLowerCase();
+    else if (name === 'expect') expectContinue = value.toLowerCase() === '100-continue';
+  }
+  const keepAlive = version === 'HTTP/1.1' ? connection !== 'close' : connection === 'keep-alive';
+  const bodyStart = headEnd + 4;
+  if (expectContinue) sock.write(RESP_100);
+  if (chunked) {
+    let pos = bodyStart;
+    const parts: Buffer[] = [];
+    for (;;) {
+      const eol = buf.indexOf('\r\n', pos);
+      if (eol === -1) return null;
+      const size = parseInt(buf.subarray(pos, eol).toString('latin1').split(';')[0]!.trim(), 16);
+      if (Number.isNaN(size) || size < 0) {
+        sock.destroy();
+        return null;
+      }
+      if (size === 0) {
+        let rest: Buffer;
+        if (buf[eol + 2] === 13 && buf[eol + 3] === 10) rest = buf.subarray(eol + 4);
+        else {
+          const trailerEnd = buf.indexOf('\r\n\r\n', eol + 2);
+          if (trailerEnd === -1) return null;
+          rest = buf.subarray(trailerEnd + 4);
+        }
+        const body = parts.length === 1 ? parts[0]! : Buffer.concat(parts);
+        return { req: { method, url: target, headers: { host, authorization }, body }, rest, keepAlive };
+      }
+      const dataStart = eol + 2;
+      if (buf.length < dataStart + size + 2) return null;
+      parts.push(buf.subarray(dataStart, dataStart + size));
+      pos = dataStart + size + 2;
+    }
+  }
+  if (contentLength > 64 * 1024 * 1024) {
+    sock.destroy();
+    return null;
+  }
+  if (buf.length < bodyStart + contentLength) return null;
+  const body = contentLength === 0 ? EMPTY_BUF : buf.subarray(bodyStart, bodyStart + contentLength);
+  return { req: { method, url: target, headers: { host, authorization }, body }, rest: buf.subarray(bodyStart + contentLength), keepAlive };
+}
+
+function authed(req: Req): boolean {
   if (TOKEN === '') return true; // standalone local runs
   const header = req.headers.authorization ?? '';
   return header === `Bearer ${TOKEN}`;
 }
 
-function readBody(req: http.IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let total = 0;
-    req.on('data', (chunk: Buffer) => {
-      total += chunk.length;
-      if (total > 64 * 1024 * 1024) {
-        reject(new Error('body too large'));
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
-}
+function handleRequest(req: Req, res: Res): void {
+  try {
+    const method = req.method;
+    const url = new URL(req.url, `http://${req.headers.host ?? '127.0.0.1'}`);
+    const pathname = url.pathname;
+    const query = url.searchParams;
 
-const server = http.createServer((req, res) => {
-  void (async () => {
-    try {
-      const method = req.method ?? 'GET';
-      const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
-      const pathname = url.pathname;
-      const query = url.searchParams;
+    if (pathname === '/healthz' && method === 'GET') {
+      return sendJson(res, 200, { ok: true });
+    }
 
-      if (pathname === '/healthz' && method === 'GET') {
-        return sendJson(res, 200, { ok: true });
-      }
+    const hasBody = method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
+    const rawBody = hasBody ? req.body : EMPTY_BUF;
 
-      const hasBody = method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
-      const rawBody = hasBody ? await readBody(req) : Buffer.alloc(0);
-
-      // Git smart HTTP: /{owner}/{repo}.git/...
-      const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(.*)$/.exec(pathname);
-      if (gitMatch !== null) {
-        if (!authed(req)) return sendErr(res, 401, 'Unauthorized');
-        const owner = decodeURIComponent(gitMatch[1]!);
-        const repoName = decodeURIComponent(gitMatch[2]!);
-        const tail = gitMatch[3]!;
-        const repo = getRepo(owner, repoName);
-        if (repo === undefined) return sendErr(res, 404, 'Not Found');
-        if (tail === 'info/refs' && method === 'GET') {
-          const service = query.get('service') ?? '';
-          if (service === 'git-upload-pack') {
-            res.writeHead(200, {
-              'content-type': 'application/x-git-upload-pack-advertisement',
-              'x-github-request-id': `req-${++reqSeq}`,
-            });
-            res.end(uploadPackAdvertisement(repo));
-            return;
-          }
-          if (service === 'git-receive-pack') {
-            res.writeHead(200, {
-              'content-type': 'application/x-git-receive-pack-advertisement',
-              'x-github-request-id': `req-${++reqSeq}`,
-            });
-            res.end(receivePackAdvertisement(repo));
-            return;
-          }
-          return sendErr(res, 404, 'Not Found');
-        }
-        if (tail === 'git-upload-pack' && method === 'POST') {
-          const first = decodePktLines(rawBody)[0];
-          const firstLine = first && first.kind === 'data' ? first.payload.toString('utf8') : '';
-          let out: Buffer;
-          if (firstLine.startsWith('command=ls-refs')) out = lsRefsResponse(repo, rawBody);
-          else if (firstLine.startsWith('command=fetch')) out = fetchResponse(repo, rawBody);
-          else return sendErr(res, 400, 'Unknown git-upload-pack command');
+    // Git smart HTTP: /{owner}/{repo}.git/...
+    const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(.*)$/.exec(pathname);
+    if (gitMatch !== null) {
+      if (!authed(req)) return sendErr(res, 401, 'Unauthorized');
+      const owner = decodeURIComponent(gitMatch[1]!);
+      const repoName = decodeURIComponent(gitMatch[2]!);
+      const tail = gitMatch[3]!;
+      const repo = getRepo(owner, repoName);
+      if (repo === undefined) return sendErr(res, 404, 'Not Found');
+      if (tail === 'info/refs' && method === 'GET') {
+        const service = query.get('service') ?? '';
+        if (service === 'git-upload-pack') {
           res.writeHead(200, {
-            'content-type': 'application/x-git-upload-pack-result',
+            'content-type': 'application/x-git-upload-pack-advertisement',
             'x-github-request-id': `req-${++reqSeq}`,
           });
-          res.end(out);
+          res.end(uploadPackAdvertisement(repo));
           return;
         }
-        if (tail === 'git-receive-pack' && method === 'POST') {
-          const out = receivePackResponse(repo, rawBody);
+        if (service === 'git-receive-pack') {
           res.writeHead(200, {
-            'content-type': 'application/x-git-receive-pack-result',
+            'content-type': 'application/x-git-receive-pack-advertisement',
             'x-github-request-id': `req-${++reqSeq}`,
           });
-          res.end(out);
+          res.end(receivePackAdvertisement(repo));
           return;
         }
         return sendErr(res, 404, 'Not Found');
       }
+      if (tail === 'git-upload-pack' && method === 'POST') {
+        const first = decodePktLines(rawBody)[0];
+        const firstLine = first && first.kind === 'data' ? first.payload.toString('utf8') : '';
+        let out: Buffer;
+        if (firstLine.startsWith('command=ls-refs')) out = lsRefsResponse(repo, rawBody);
+        else if (firstLine.startsWith('command=fetch')) out = fetchResponse(repo, rawBody);
+        else return sendErr(res, 400, 'Unknown git-upload-pack command');
+        res.writeHead(200, {
+          'content-type': 'application/x-git-upload-pack-result',
+          'x-github-request-id': `req-${++reqSeq}`,
+        });
+        res.end(out);
+        return;
+      }
+      if (tail === 'git-receive-pack' && method === 'POST') {
+        const out = receivePackResponse(repo, rawBody);
+        res.writeHead(200, {
+          'content-type': 'application/x-git-receive-pack-result',
+          'x-github-request-id': `req-${++reqSeq}`,
+        });
+        res.end(out);
+        return;
+      }
+      return sendErr(res, 404, 'Not Found');
+    }
 
-      // JSON surfaces need auth first.
-      if (!authed(req)) return sendErr(res, 401, 'Unauthorized');
+    // JSON surfaces need auth first.
+    if (!authed(req)) return sendErr(res, 401, 'Unauthorized');
 
-      if (pathname === '/api/graphql' && method === 'POST') {
-        let parsed: unknown;
+    if (pathname === '/api/graphql' && method === 'POST') {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(rawBody.toString('utf8'));
+      } catch {
+        return sendErr(res, 400, 'Malformed JSON body');
+      }
+      const runOne = (doc: unknown): Record<string, unknown> => {
+        if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
+          return { data: null, errors: [{ message: 'Invalid GraphQL operation' }] };
+        }
+        const d = doc as Record<string, unknown>;
+        const queryText = typeof d.query === 'string' ? d.query : '';
+        const variables = (d.variables ?? {}) as Record<string, unknown>;
         try {
-          parsed = JSON.parse(rawBody.toString('utf8'));
+          const parser = new GqlParser(queryText);
+          const ops = parser.parseDocument();
+          if (ops.length === 0) return { data: null, errors: [{ message: 'No operation found' }] };
+          return gqlExecute(ops[0]!, variables);
+        } catch (e) {
+          return { data: null, errors: [{ message: e instanceof Error ? e.message : String(e) }] };
+        }
+      };
+      if (Array.isArray(parsed)) {
+        return sendJson(res, 200, parsed.map(runOne));
+      }
+      return sendJson(res, 200, runOne(parsed));
+    }
+
+    if (pathname === '/mcp' && method === 'POST') {
+      return handleMcp(res, rawBody);
+    }
+
+    if (pathname.startsWith('/api/v3')) {
+      let body: unknown = null;
+      if (rawBody.length > 0) {
+        try {
+          body = JSON.parse(rawBody.toString('utf8'));
         } catch {
           return sendErr(res, 400, 'Malformed JSON body');
         }
-        const runOne = (doc: unknown): Record<string, unknown> => {
-          if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
-            return { data: null, errors: [{ message: 'Invalid GraphQL operation' }] };
-          }
-          const d = doc as Record<string, unknown>;
-          const queryText = typeof d.query === 'string' ? d.query : '';
-          const variables = (d.variables ?? {}) as Record<string, unknown>;
-          try {
-            const parser = new GqlParser(queryText);
-            const ops = parser.parseDocument();
-            if (ops.length === 0) return { data: null, errors: [{ message: 'No operation found' }] };
-            return gqlExecute(ops[0]!, variables);
-          } catch (e) {
-            return { data: null, errors: [{ message: e instanceof Error ? e.message : String(e) }] };
-          }
-        };
-        if (Array.isArray(parsed)) {
-          return sendJson(res, 200, parsed.map(runOne));
-        }
-        return sendJson(res, 200, runOne(parsed));
       }
-
-      if (pathname === '/mcp' && method === 'POST') {
-        return handleMcp(res, rawBody);
-      }
-
-      if (pathname.startsWith('/api/v3')) {
-        let body: unknown = null;
-        if (rawBody.length > 0) {
+      const rest = pathname.slice('/api/v3'.length);
+      const segs = rest
+        .split('/')
+        .filter((s) => s !== '')
+        .map((s) => {
           try {
-            body = JSON.parse(rawBody.toString('utf8'));
+            return decodeURIComponent(s);
           } catch {
-            return sendErr(res, 400, 'Malformed JSON body');
+            return s;
           }
-        }
-        const rest = pathname.slice('/api/v3'.length);
-        const segs = rest
-          .split('/')
-          .filter((s) => s !== '')
-          .map((s) => {
-            try {
-              return decodeURIComponent(s);
-            } catch {
-              return s;
-            }
-          });
-        if (handleRest(req, res, method, segs, query, body)) return;
-        return sendErr(res, 404, 'Not Found');
-      }
-
+        });
+      if (handleRest(req, res, method, segs, query, body)) return;
       return sendErr(res, 404, 'Not Found');
-    } catch (e) {
-      if (!res.headersSent) {
-        try {
-          sendErr(res, 500, e instanceof Error ? e.message : 'Internal error');
-        } catch {
-          // the socket is gone; nothing left to do
-        }
+    }
+
+    return sendErr(res, 404, 'Not Found');
+  } catch (e) {
+    if (!res.headersSent) {
+      try {
+        sendErr(res, 500, e instanceof Error ? e.message : 'Internal error');
+      } catch {
+        // the socket is gone; nothing left to do
       }
     }
-  })();
+  }
+}
+
+const server = net.createServer((sock) => {
+  sock.setNoDelay(true);
+  let buf: Buffer = EMPTY_BUF;
+  sock.on('data', (chunk: Buffer) => {
+    buf = buf.length === 0 ? chunk : Buffer.concat([buf, chunk]);
+    for (;;) {
+      const parsed = tryParse(buf, sock);
+      if (parsed === null) return;
+      buf = parsed.rest;
+      handleRequest(parsed.req, new Res(sock, parsed.keepAlive));
+      if (!parsed.keepAlive || sock.destroyed) return;
+    }
+  });
+  sock.on('error', () => undefined);
 });
 
 // ---------------------------------------------------------------------------
